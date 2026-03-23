@@ -13,7 +13,7 @@ tasks that manage the lifecycle and execution of frame processing pipelines.
 import asyncio
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import AsyncIterable, Iterable
+from typing import AsyncIterable, Iterable, Optional
 
 from pipecat.frames.frames import Frame
 from pipecat.utils.base_object import BaseObject
@@ -24,10 +24,11 @@ class PipelineTaskParams:
     """Configuration parameters for pipeline task execution.
 
     Parameters:
-        loop: The asyncio event loop to use for task execution.
+        loop: The asyncio event loop to use for task execution. Unused (and
+            should be ``None``) when running under trio.
     """
 
-    loop: asyncio.AbstractEventLoop
+    loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 class BasePipelineTask(BaseObject):

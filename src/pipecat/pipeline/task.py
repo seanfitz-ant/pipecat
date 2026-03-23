@@ -593,8 +593,19 @@ class PipelineTask(BasePipelineTask):
         if self.has_finished():
             return
 
+        # Under trio, the TaskManager needs a task group to spawn children into
+        # (structured concurrency). Under asyncio this is a no-op context.
+        if compat.current_backend() == "trio":
+            async with compat.create_task_group() as tg:
+                await self._run(params, task_group=tg)
+                tg.cancel_scope.cancel()
+        else:
+            await self._run(params, task_group=None)
+
+    async def _run(self, params: PipelineTaskParams, task_group=None):
+        """Internal run body, shared across backends."""
         # Setup processors.
-        await self._setup(params)
+        await self._setup(params, task_group=task_group)
 
         # Create all main tasks and wait for the main push task. This is the
         # task that pushes frames to the very beginning of our pipeline (i.e. to
@@ -783,7 +794,7 @@ class PipelineTask(BasePipelineTask):
             await self._process_push_task
             self._process_push_task = None
 
-    async def _setup(self, params: PipelineTaskParams):
+    async def _setup(self, params: PipelineTaskParams, task_group=None):
         """Set up the pipeline task and all processors."""
         # Do any additional pipeline task setup externally.
         await self._load_setup_files()
@@ -791,7 +802,7 @@ class PipelineTask(BasePipelineTask):
         # Load additional observers.
         await self._load_observer_files()
 
-        mgr_params = TaskManagerParams(loop=params.loop)
+        mgr_params = TaskManagerParams(loop=params.loop, task_group=task_group)
         self._task_manager.setup(mgr_params)
 
         setup = FrameProcessorSetup(
