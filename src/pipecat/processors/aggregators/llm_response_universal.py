@@ -11,7 +11,6 @@ and conversation context. These aggregators handle the flow between speech-to-te
 LLM processing, and text-to-speech components in conversational AI pipelines.
 """
 
-import asyncio
 import json
 import warnings
 from abc import abstractmethod
@@ -83,6 +82,7 @@ from pipecat.turns.user_stop import BaseUserTurnStopStrategy, UserTurnStoppedPar
 from pipecat.turns.user_turn_completion_mixin import UserTurnCompletionConfig
 from pipecat.turns.user_turn_controller import UserTurnController
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies, UserTurnStrategies
+from pipecat.utils.asyncio import compat
 from pipecat.utils.context.llm_context_summarization import (
     LLMAutoContextSummarizationConfig,
     LLMContextSummarizationConfig,
@@ -864,7 +864,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
 
         self._function_calls_in_progress: Dict[str, Optional[FunctionCallInProgressFrame]] = {}
         self._function_calls_image_results: Dict[str, UserImageRawFrame] = {}
-        self._context_updated_tasks: Set[asyncio.Task] = set()
+        self._context_updated_tasks: Set[compat.Task] = set()
 
         self._assistant_turn_start_timestamp = ""
 
@@ -1109,9 +1109,21 @@ class LLMAssistantAggregator(LLMContextAggregator):
         # sure we don't block the pipeline.
         if properties and properties.on_context_updated:
             task_name = f"{frame.function_name}:{frame.tool_call_id}:on_context_updated"
-            task = self.create_task(properties.on_context_updated(), task_name)
+            on_context_updated = properties.on_context_updated
+
+            # Wrap the callback so it removes itself from the tracking set on
+            # completion. This replaces the previous add_done_callback()
+            # approach, which has no equivalent on trio/anyio TaskHandle. The
+            # closure captures `task` by reference; by the time the finally
+            # block runs, `task` is guaranteed to be bound below.
+            async def _run():
+                try:
+                    await on_context_updated()
+                finally:
+                    self._context_updated_tasks.discard(task)  # noqa: F821
+
+            task = self.create_task(_run(), task_name)
             self._context_updated_tasks.add(task)
-            task.add_done_callback(self._context_updated_task_finished)
 
     async def _handle_function_call_cancel(self, frame: FunctionCallCancelFrame):
         logger.debug(
@@ -1249,9 +1261,6 @@ class LLMAssistantAggregator(LLMContextAggregator):
                 and message["tool_call_id"] == tool_call_id
             ):
                 message["content"] = result
-
-    def _context_updated_task_finished(self, task: asyncio.Task):
-        self._context_updated_tasks.discard(task)
 
     async def _trigger_assistant_turn_started(self):
         self._assistant_turn_start_timestamp = time_now_iso8601()

@@ -11,9 +11,7 @@ data structures for voice activity detection in audio streams. Includes state
 management, parameter configuration, and audio analysis framework.
 """
 
-import asyncio
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from typing import Optional
 
@@ -21,6 +19,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 from pipecat.audio.utils import calculate_audio_volume, exp_smoothing
+from pipecat.utils.asyncio import compat
 
 VAD_CONFIDENCE = 0.7
 VAD_START_SECS = 0.2
@@ -86,9 +85,10 @@ class VADAnalyzer(ABC):
         self._smoothing_factor = 0.2
         self._prev_volume = 0
 
-        # Thread executor that will run the model. We only need one thread per
-        # analyzer because one analyzer just handles one audio stream.
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        # Capacity limiter that serializes model runs in a worker thread. We
+        # only need one worker per analyzer because one analyzer just handles
+        # one audio stream.
+        self._limiter = compat.CapacityLimiter(1)
 
     @property
     def sample_rate(self) -> int:
@@ -183,8 +183,7 @@ class VADAnalyzer(ABC):
         Returns:
             Current VAD state after processing the buffer.
         """
-        loop = asyncio.get_running_loop()
-        state = await loop.run_in_executor(self._executor, self._run_analyzer, buffer)
+        state = await compat.to_thread.run_sync(self._run_analyzer, buffer, limiter=self._limiter)
         return state
 
     def _run_analyzer(self, buffer: bytes) -> VADState:

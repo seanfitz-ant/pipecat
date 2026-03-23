@@ -6,7 +6,6 @@
 
 """RTVIProcessor: main RTVI protocol processor."""
 
-import asyncio
 import base64
 from typing import Any, Dict, Mapping, Optional
 
@@ -55,6 +54,7 @@ from pipecat.services.llm_service import (
 )
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_transport import BaseTransport
+from pipecat.utils.asyncio import compat
 
 
 class RTVIProcessor(FrameProcessor):
@@ -94,10 +94,10 @@ class RTVIProcessor(FrameProcessor):
         self._registered_services: Dict[str, RTVIService] = {}
 
         # A task to process incoming action frames.
-        self._action_task: Optional[asyncio.Task] = None
+        self._action_task: Optional[compat.Task] = None
 
         # A task to process incoming transport messages.
-        self._message_task: Optional[asyncio.Task] = None
+        self._message_task: Optional[compat.Task] = None
 
         self._register_event_handler("on_bot_started")
         self._register_event_handler("on_client_ready")
@@ -293,10 +293,10 @@ class RTVIProcessor(FrameProcessor):
     async def _start(self, frame: StartFrame):
         """Start the RTVI processor tasks."""
         if not self._action_task:
-            self._action_queue = asyncio.Queue()
+            self._action_queue = compat.Queue()
             self._action_task = self.create_task(self._action_task_handler())
         if not self._message_task:
-            self._message_queue = asyncio.Queue()
+            self._message_queue = compat.Queue()
             self._message_task = self.create_task(self._message_task_handler())
         await self._call_event_handler("on_bot_started")
 

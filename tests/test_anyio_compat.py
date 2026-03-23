@@ -15,6 +15,7 @@ import anyio
 import pytest
 
 from pipecat.utils.asyncio.anyio_task_manager import AnyioTaskManager, TaskHandle
+from pipecat.utils.asyncio.task_manager import TaskManager, TaskManagerParams
 
 pytestmark = pytest.mark.anyio
 from pipecat.utils.asyncio.compat import (
@@ -22,8 +23,10 @@ from pipecat.utils.asyncio.compat import (
     PriorityQueue,
     Queue,
     current_backend,
+    gather,
     get_cancelled_exc_class,
     sleep,
+    wait_for,
 )
 
 
@@ -46,6 +49,40 @@ class TestCompatPrimitives:
         ev.set()
         assert ev.is_set()
         await ev.wait()
+
+    async def test_event_clear(self, anyio_backend):
+        ev = Event()
+        ev.set()
+        assert ev.is_set()
+        ev.clear()
+        assert not ev.is_set()
+        ev.set()
+        assert ev.is_set()
+
+    async def test_wait_for_success(self, anyio_backend):
+        async def quick():
+            await sleep(0)
+            return "done"
+
+        assert await wait_for(quick(), timeout=1.0) == "done"
+
+    async def test_wait_for_timeout(self, anyio_backend):
+        async def slow():
+            await sleep(10)
+
+        with pytest.raises(TimeoutError):
+            await wait_for(slow(), timeout=0.01)
+
+    async def test_gather(self, anyio_backend):
+        async def val(x):
+            await sleep(0)
+            return x * 2
+
+        results = await gather(val(1), val(2), val(3))
+        assert results == [2, 4, 6]
+
+    async def test_gather_empty(self, anyio_backend):
+        assert await gather() == []
 
     async def test_cancelled_exc_class(self, anyio_backend):
         exc = get_cancelled_exc_class()
@@ -224,3 +261,38 @@ class TestAnyioTaskManager:
             else:
                 loop = tm.get_event_loop()
                 assert loop is not None
+
+
+class TestUnifiedTaskManager:
+    """Verify the primary TaskManager works on both asyncio and trio."""
+
+    async def test_create_and_cancel(self, anyio_backend):
+        tm = TaskManager()
+
+        async def worker():
+            await sleep(10)
+
+        if anyio_backend == "asyncio":
+            import asyncio
+
+            tm.setup(TaskManagerParams(loop=asyncio.get_running_loop()))
+            task = tm.create_task(worker(), name="w")
+            assert task.get_name() == "w"
+            await tm.cancel_task(task, timeout=1.0)
+            assert task.done()
+        else:
+            async with anyio.create_task_group() as tg:
+                tm.setup(TaskManagerParams(task_group=tg))
+                task = tm.create_task(worker(), name="w")
+                assert task.get_name() == "w"
+                await sleep(0)
+                await tm.cancel_task(task, timeout=1.0)
+                assert task.done()
+                tg.cancel_scope.cancel()
+
+    async def test_trio_requires_task_group(self, anyio_backend):
+        if anyio_backend != "trio":
+            pytest.skip("trio-specific")
+        tm = TaskManager()
+        with pytest.raises(RuntimeError, match="requires a task_group"):
+            tm.setup(TaskManagerParams())

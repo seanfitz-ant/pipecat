@@ -20,6 +20,7 @@ from loguru import logger
 
 from pipecat.pipeline.base_task import PipelineTaskParams
 from pipecat.pipeline.task import PipelineTask
+from pipecat.utils.asyncio import compat
 from pipecat.utils.base_object import BaseObject
 
 
@@ -54,7 +55,15 @@ class PipelineRunner(BaseObject):
         self._tasks = {}
         self._sig_task = None
         self._force_gc = force_gc
-        self._loop = loop or asyncio.get_running_loop()
+        # TODO(anyio): asyncio.AbstractEventLoop has no trio equivalent. The
+        # loop is passed through to PipelineTaskParams for legacy asyncio
+        # callers; under trio this stays None and downstream code must cope.
+        if loop is not None:
+            self._loop = loop
+        elif compat.current_backend() == "asyncio":
+            self._loop = asyncio.get_running_loop()
+        else:
+            self._loop = None
 
         if handle_sigint:
             self._setup_sigint()
@@ -71,12 +80,12 @@ class PipelineRunner(BaseObject):
         logger.debug(f"Runner {self} started running {task}")
         self._tasks[task.name] = task
 
-        # PipelineTask handles asyncio.CancelledError to shutdown the pipeline
+        # PipelineTask handles cancellation to shutdown the pipeline
         # properly and re-raises it in case there's more cleanup to do.
         try:
             params = PipelineTaskParams(loop=self._loop)
             await task.run(params)
-        except asyncio.CancelledError:
+        except compat.get_cancelled_exc_class():
             pass
 
         del self._tasks[task.name]
@@ -97,7 +106,7 @@ class PipelineRunner(BaseObject):
     async def stop_when_done(self):
         """Schedule all running tasks to stop when their current processing is complete."""
         logger.debug(f"Runner {self} scheduled to stop when all tasks are done")
-        await asyncio.gather(*[t.stop_when_done() for t in self._tasks.values()])
+        await compat.gather(*[t.stop_when_done() for t in self._tasks.values()])
 
     async def cancel(self):
         """Cancel all running tasks immediately."""
@@ -106,10 +115,20 @@ class PipelineRunner(BaseObject):
 
     async def _cancel(self):
         """Cancel all running tasks immediately."""
-        await asyncio.gather(*[t.cancel() for t in self._tasks.values()])
+        await compat.gather(*[t.cancel() for t in self._tasks.values()])
 
     def _setup_sigint(self):
         """Set up signal handlers for graceful shutdown."""
+        # TODO(anyio): loop.add_signal_handler is asyncio-only. Trio/anyio
+        # exposes signals via anyio.open_signal_receiver (an async iterator)
+        # which requires a running task rather than a sync callback. Under
+        # trio, signal handling must be restructured to run inside run().
+        if compat.current_backend() != "asyncio":
+            logger.warning(
+                "PipelineRunner signal handling is not yet supported under "
+                f"{compat.current_backend()}; SIGINT will not be caught."
+            )
+            return
         try:
             loop = asyncio.get_running_loop()
             loop.add_signal_handler(signal.SIGINT, lambda *args: self._sig_handler())
@@ -119,6 +138,13 @@ class PipelineRunner(BaseObject):
 
     def _setup_sigterm(self):
         """Set up signal handlers for graceful shutdown."""
+        # TODO(anyio): see _setup_sigint for the trio limitation.
+        if compat.current_backend() != "asyncio":
+            logger.warning(
+                "PipelineRunner signal handling is not yet supported under "
+                f"{compat.current_backend()}; SIGTERM will not be caught."
+            )
+            return
         try:
             loop = asyncio.get_running_loop()
             loop.add_signal_handler(signal.SIGTERM, lambda *args: self._sig_handler())
@@ -128,6 +154,10 @@ class PipelineRunner(BaseObject):
 
     def _sig_handler(self):
         """Handle interrupt signals by cancelling all tasks."""
+        # TODO(anyio): asyncio.create_task from a sync callback has no trio
+        # equivalent (trio requires a nursery). This path is only reachable
+        # under asyncio because _setup_sigint/_setup_sigterm bail out early
+        # on other backends.
         if not self._sig_task:
             self._sig_task = asyncio.create_task(self._sig_cancel())
 

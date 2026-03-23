@@ -11,7 +11,6 @@ and conversation context. These aggregators handle the flow between speech-to-te
 LLM processing, and text-to-speech components in conversational AI pipelines.
 """
 
-import asyncio
 import warnings
 from abc import abstractmethod
 from dataclasses import dataclass
@@ -60,6 +59,7 @@ from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContextFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.utils.asyncio import compat
 from pipecat.utils.time import time_now_iso8601
 
 
@@ -486,7 +486,7 @@ class LLMUserContextAggregator(LLMContextResponseAggregator):
         self._seen_interim_results = False
         self._waiting_for_aggregation = False
 
-        self._aggregation_event = asyncio.Event()
+        self._aggregation_event = compat.Event()
         self._aggregation_task = None
 
     async def reset(self):
@@ -737,9 +737,9 @@ class LLMUserContextAggregator(LLMContextResponseAggregator):
                         if self._vad_params
                         else self._params.turn_emulated_vad_timeout
                     )
-                await asyncio.wait_for(self._aggregation_event.wait(), timeout=timeout)
+                await compat.wait_for(self._aggregation_event.wait(), timeout)
                 await self._maybe_emulate_user_speaking()
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 if not self._user_speaking:
                     await self.push_aggregation()
 
@@ -834,7 +834,7 @@ class LLMAssistantContextAggregator(LLMContextResponseAggregator):
 
         self._started = 0
         self._function_calls_in_progress: Dict[str, Optional[FunctionCallInProgressFrame]] = {}
-        self._context_updated_tasks: Set[asyncio.Task] = set()
+        self._context_updated_tasks: Set[compat.Task] = set()
 
     @property
     def has_function_calls_in_progress(self) -> bool:
@@ -1016,9 +1016,21 @@ class LLMAssistantContextAggregator(LLMContextResponseAggregator):
         # sure we don't block the pipeline.
         if properties and properties.on_context_updated:
             task_name = f"{frame.function_name}:{frame.tool_call_id}:on_context_updated"
-            task = self.create_task(properties.on_context_updated(), task_name)
+            on_context_updated = properties.on_context_updated
+
+            # Wrap the callback so it removes itself from the tracking set on
+            # completion. This replaces the previous add_done_callback()
+            # approach, which has no equivalent on trio/anyio TaskHandle. The
+            # closure captures `task` by reference; by the time the finally
+            # block runs, `task` is guaranteed to be bound below.
+            async def _run():
+                try:
+                    await on_context_updated()
+                finally:
+                    self._context_updated_tasks.discard(task)  # noqa: F821
+
+            task = self.create_task(_run(), task_name)
             self._context_updated_tasks.add(task)
-            task.add_done_callback(self._context_updated_task_finished)
 
     async def _handle_function_call_cancel(self, frame: FunctionCallCancelFrame):
         logger.debug(
@@ -1066,9 +1078,6 @@ class LLMAssistantContextAggregator(LLMContextResponseAggregator):
             self._aggregation += f" {frame.text}" if self._aggregation else frame.text
         else:
             self._aggregation += frame.text
-
-    def _context_updated_task_finished(self, task: asyncio.Task):
-        self._context_updated_tasks.discard(task)
 
 
 class LLMUserResponseAggregator(LLMUserContextAggregator):

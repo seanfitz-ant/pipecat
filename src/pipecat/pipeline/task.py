@@ -11,7 +11,6 @@ execution, frame routing, lifecycle management, and monitoring capabilities
 including heartbeats, idle detection, and observer integration.
 """
 
-import asyncio
 import importlib.util
 import os
 from pathlib import Path
@@ -51,6 +50,7 @@ from pipecat.pipeline.task_observer import TaskObserver
 from pipecat.processors.aggregators.llm_response import LLMUserContextAggregator
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIObserverParams, RTVIProcessor
+from pipecat.utils.asyncio import compat
 from pipecat.utils.asyncio.task_manager import BaseTaskManager, TaskManager, TaskManagerParams
 from pipecat.utils.tracing.setup import is_tracing_available
 from pipecat.utils.tracing.tracing_context import TracingContext
@@ -71,12 +71,12 @@ class IdleFrameObserver(BaseObserver):
     """Idle timeout observer.
 
     This observer waits for specific frames being generated in the pipeline. If
-    the frames are generated the given asyncio event is set. If the event is not
+    the frames are generated the given event is set. If the event is not
     set it means the pipeline is probably idle.
 
     """
 
-    def __init__(self, *, idle_event: asyncio.Event, idle_timeout_frames: Tuple[Type[Frame], ...]):
+    def __init__(self, *, idle_event: compat.Event, idle_timeout_frames: Tuple[Type[Frame], ...]):
         """Initialize the observer.
 
         Args:
@@ -314,19 +314,19 @@ class PipelineTask(BasePipelineTask):
         self._finished = False
         self._cancelled = False
 
-        # This task maneger will handle all the asyncio tasks created by this
+        # This task maneger will handle all the async tasks created by this
         # PipelineTask and its frame processors.
         self._task_manager = task_manager or TaskManager()
 
         # This queue is the queue used to push frames to the pipeline.
-        self._push_queue = asyncio.Queue()
-        self._process_push_task: Optional[asyncio.Task] = None
+        self._push_queue: compat.Queue = compat.Queue()
+        self._process_push_task: Optional[compat.Task] = None
 
         # This is the heartbeat queue. When a heartbeat frame is received in the
         # down queue we add it to the heartbeat queue for processing.
-        self._heartbeat_queue = asyncio.Queue()
-        self._heartbeat_push_task: Optional[asyncio.Task] = None
-        self._heartbeat_monitor_task: Optional[asyncio.Task] = None
+        self._heartbeat_queue: compat.Queue = compat.Queue()
+        self._heartbeat_push_task: Optional[compat.Task] = None
+        self._heartbeat_monitor_task: Optional[compat.Task] = None
 
         # RTVI support
         self._rtvi = None
@@ -364,8 +364,8 @@ class PipelineTask(BasePipelineTask):
         # This is the idle event. When selected frames are pushed from any
         # processor we consider the pipeline is not idle. We use an observer
         # which will be listening any part of the pipeline.
-        self._idle_event = asyncio.Event()
-        self._idle_monitor_task: Optional[asyncio.Task] = None
+        self._idle_event = compat.Event()
+        self._idle_monitor_task: Optional[compat.Task] = None
         if self._idle_timeout_secs:
             idle_frame_observer = IdleFrameObserver(
                 idle_event=self._idle_event,
@@ -375,14 +375,14 @@ class PipelineTask(BasePipelineTask):
 
         # This event is used to indicate the StartFrame has been received at the
         # end of the pipeline.
-        self._pipeline_start_event = asyncio.Event()
+        self._pipeline_start_event = compat.Event()
 
         # This event is used to indicate a finalize frame (e.g. EndFrame,
         # StopFrame) has been received at the end of the pipeline.
-        self._pipeline_end_event = asyncio.Event()
+        self._pipeline_end_event = compat.Event()
 
         # This event is set when the pipeline truly finishes.
-        self._pipeline_finished_event = asyncio.Event()
+        self._pipeline_finished_event = compat.Event()
 
         # This is the final pipeline. It is composed of a source processor,
         # followed by the user pipeline, and ending with a sink processor. The
@@ -604,7 +604,7 @@ class PipelineTask(BasePipelineTask):
         try:
             # Wait for pipeline to finish.
             await self._wait_for_pipeline_finished()
-        except asyncio.CancelledError:
+        except compat.get_cancelled_exc_class():
             logger.debug(f"Pipeline task {self} got cancelled from outside...")
             # We have been cancelled from outside, let's just cancel everything.
             await self._cancel()
@@ -617,7 +617,7 @@ class PipelineTask(BasePipelineTask):
             # We can reach this point for different reasons:
             #
             # 1. The pipeline task has finished (try case).
-            # 2. By an asyncio task cancellation (except case).
+            # 2. By an async task cancellation (except case).
             logger.debug(f"Pipeline task {self} is finishing...")
             await self._cancel_tasks()
             if self._check_dangling_tasks:
@@ -752,11 +752,9 @@ class PipelineTask(BasePipelineTask):
 
         async def wait_for_cancel():
             try:
-                await asyncio.wait_for(
-                    self._pipeline_end_event.wait(), timeout=self._cancel_timeout_secs
-                )
+                await compat.wait_for(self._pipeline_end_event.wait(), self._cancel_timeout_secs)
                 logger.debug(f"{self}: {frame} reached the end of the pipeline.")
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     f"{self}: timeout waiting for {frame} to reach the end of the pipeline (being blocked somewhere?)."
                 )
@@ -954,7 +952,7 @@ class PipelineTask(BasePipelineTask):
             # task will just stop waiting for the pipeline to finish not
             # allowing more frames to be pushed.
             await self._pipeline.queue_frame(HeartbeatFrame(timestamp=self._clock.get_time()))
-            await asyncio.sleep(self._params.heartbeats_period_secs)
+            await compat.sleep(self._params.heartbeats_period_secs)
 
     async def _heartbeat_monitor_handler(self):
         """Monitor heartbeat frames for processing time and timeout detection.
@@ -967,11 +965,11 @@ class PipelineTask(BasePipelineTask):
         wait_time = HEARTBEAT_MONITOR_SECS
         while True:
             try:
-                frame = await asyncio.wait_for(self._heartbeat_queue.get(), timeout=wait_time)
+                frame = await compat.wait_for(self._heartbeat_queue.get(), wait_time)
                 process_time = (self._clock.get_time() - frame.timestamp) / 1_000_000_000
                 logger.trace(f"{self}: heartbeat frame processed in {process_time} seconds")
                 self._heartbeat_queue.task_done()
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     f"{self}: heartbeat frame not received for more than {wait_time} seconds"
                 )
@@ -987,9 +985,9 @@ class PipelineTask(BasePipelineTask):
         running = True
         while running:
             try:
-                await asyncio.wait_for(self._idle_event.wait(), timeout=self._idle_timeout_secs)
+                await compat.wait_for(self._idle_event.wait(), self._idle_timeout_secs)
                 self._idle_event.clear()
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 running = await self._idle_timeout_detected()
 
     async def _idle_timeout_detected(self) -> bool:

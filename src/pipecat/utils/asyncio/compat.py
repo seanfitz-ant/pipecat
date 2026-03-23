@@ -32,13 +32,52 @@ from __future__ import annotations
 
 import heapq
 import math
-from typing import Generic, TypeVar
+import sys
+from collections.abc import Awaitable, Callable, Coroutine
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, Union, runtime_checkable
 
 import anyio
+import anyio.abc
 import anyio.lowlevel
+import anyio.to_thread
 import sniffio
 
 T = TypeVar("T")
+R = TypeVar("R")
+
+if TYPE_CHECKING:
+    import asyncio
+
+    from pipecat.utils.asyncio.anyio_task_manager import TaskHandle
+
+    # Type alias for code that accepts either an asyncio.Task (legacy) or a
+    # TaskHandle (anyio). Use this in signatures that need to work on both
+    # backends.
+    Task = Union[asyncio.Task, TaskHandle]
+else:
+    Task = Any  # runtime fallback
+
+
+@runtime_checkable
+class TaskLike(Protocol):
+    """Structural protocol for the task API subset Pipecat uses.
+
+    Both :class:`asyncio.Task` and
+    :class:`~pipecat.utils.asyncio.anyio_task_manager.TaskHandle` satisfy
+    this protocol. Use as a type hint when you need to accept either.
+    """
+
+    def get_name(self) -> str:  # noqa: D102
+        ...
+
+    def cancel(self) -> Any:  # noqa: D102
+        ...
+
+    def done(self) -> bool:  # noqa: D102
+        ...
+
+    def cancelled(self) -> bool:  # noqa: D102
+        ...
 
 
 def current_backend() -> str:
@@ -81,7 +120,6 @@ async def checkpoint() -> None:
 
 # Re-export anyio primitives that already match the asyncio API closely
 # enough to be drop-in replacements for Pipecat's usage.
-Event = anyio.Event
 Lock = anyio.Lock
 Semaphore = anyio.Semaphore
 CapacityLimiter = anyio.CapacityLimiter
@@ -91,6 +129,90 @@ move_on_after = anyio.move_on_after
 to_thread = anyio.to_thread
 from_thread = anyio.from_thread
 create_task_group = anyio.create_task_group
+TaskGroup = anyio.abc.TaskGroup
+WouldBlock = anyio.WouldBlock
+
+
+class Event:
+    """Resettable event compatible with ``asyncio.Event``.
+
+    ``anyio.Event`` is one-shot (cannot be cleared), but Pipecat relies on
+    ``Event.clear()`` throughout the pipeline for flow control. This wrapper
+    recreates the underlying anyio event on ``clear()`` so the familiar
+    asyncio semantics hold on both backends.
+    """
+
+    def __init__(self) -> None:
+        """Create an unset event."""
+        self._event = anyio.Event()
+
+    def set(self) -> None:
+        """Set the event, waking all waiters."""
+        self._event.set()
+
+    def clear(self) -> None:
+        """Reset the event to the unset state."""
+        if self._event.is_set():
+            self._event = anyio.Event()
+
+    def is_set(self) -> bool:
+        """Return ``True`` if the event is set."""
+        return self._event.is_set()
+
+    async def wait(self) -> bool:
+        """Block until the event is set, then return ``True``."""
+        await self._event.wait()
+        return True
+
+
+async def wait_for(aw: Awaitable[R], timeout: float | None) -> R:
+    """Backend-agnostic ``asyncio.wait_for`` replacement.
+
+    Args:
+        aw: The awaitable to wait for.
+        timeout: Seconds before raising :class:`TimeoutError`, or ``None``
+            for no timeout.
+
+    Raises:
+        TimeoutError: If the timeout expires.
+    """
+    if timeout is None:
+        return await aw
+    with anyio.fail_after(timeout):
+        return await aw
+
+
+async def gather(*coros: Coroutine[Any, Any, Any]) -> list[Any]:
+    """Backend-agnostic ``asyncio.gather`` replacement.
+
+    Runs coroutines concurrently and returns results in order. Unlike
+    ``asyncio.gather``, exceptions are not collected — the first exception
+    cancels the remaining tasks and propagates (anyio task-group semantics).
+    """
+    if not coros:
+        return []
+    results: list[Any] = [None] * len(coros)
+
+    async def run(idx: int, coro: Coroutine[Any, Any, Any]) -> None:
+        results[idx] = await coro
+
+    async with anyio.create_task_group() as tg:
+        for i, coro in enumerate(coros):
+            tg.start_soon(run, i, coro)
+    return results
+
+
+async def run_sync(func: Callable[..., R], *args: Any) -> R:
+    """Run a sync function in a worker thread (``asyncio.to_thread`` equiv)."""
+    return await anyio.to_thread.run_sync(func, *args)
+
+
+if sys.version_info >= (3, 11):
+    TimeoutError = TimeoutError  # noqa: PLW0127
+else:
+    import asyncio as _asyncio
+
+    TimeoutError = _asyncio.TimeoutError  # noqa: PLW0127
 
 
 class Queue(Generic[T]):

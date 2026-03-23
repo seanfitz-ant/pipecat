@@ -11,7 +11,6 @@ using FastAPI and WebSocket connections. Supports binary and text serialization
 with configurable session timeouts and WAV header generation.
 """
 
-import asyncio
 import io
 import time
 import typing
@@ -39,6 +38,7 @@ from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.utils.asyncio import compat
 
 try:
     from fastapi import WebSocket
@@ -328,7 +328,7 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
 
     async def _monitor_websocket(self):
         """Wait for self._params.session_timeout seconds, if the websocket is still open, trigger timeout event."""
-        await asyncio.sleep(self._params.session_timeout)
+        await compat.sleep(self._params.session_timeout)
         await self._client.trigger_client_timeout()
 
 
@@ -524,7 +524,7 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
         # Simulate a clock.
         current_time = time.monotonic()
         sleep_duration = max(0, self._next_send_time - current_time)
-        await asyncio.sleep(sleep_duration)
+        await compat.sleep(sleep_duration)
         if sleep_duration == 0:
             self._next_send_time = time.monotonic() + self._send_interval
         else:

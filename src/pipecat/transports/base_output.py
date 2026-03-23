@@ -10,10 +10,8 @@ This module provides the BaseOutputTransport class which handles audio and video
 output processing, including frame buffering, mixing, timing, and media streaming.
 """
 
-import asyncio
 import itertools
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, AsyncGenerator, Dict, List, Mapping, Optional
 
 from loguru import logger
@@ -48,6 +46,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.base_transport import TransportParams
+from pipecat.utils.asyncio import compat
 from pipecat.utils.time import nanoseconds_to_seconds
 
 BOT_VAD_STOP_SECS = 0.35
@@ -400,7 +399,7 @@ class BaseOutputTransport(FrameProcessor):
             self._params = params
 
             # This is to resize images. We only need to resize one image at a time.
-            self._executor = ThreadPoolExecutor(max_workers=1)
+            self._resize_limiter = compat.CapacityLimiter(1)
 
             # Buffer to keep track of incoming audio.
             self._audio_buffer = bytearray()
@@ -427,9 +426,9 @@ class BaseOutputTransport(FrameProcessor):
             # Last time the bot actually spoke.
             self._bot_speech_last_time = 0
 
-            self._audio_task: Optional[asyncio.Task] = None
-            self._video_task: Optional[asyncio.Task] = None
-            self._clock_task: Optional[asyncio.Task] = None
+            self._audio_task: Optional[compat.Task] = None
+            self._video_task: Optional[compat.Task] = None
+            self._clock_task: Optional[compat.Task] = None
 
         @property
         def sample_rate(self) -> int:
@@ -612,7 +611,7 @@ class BaseOutputTransport(FrameProcessor):
         def _create_audio_task(self):
             """Create the audio processing task."""
             if not self._audio_task:
-                self._audio_queue = asyncio.Queue()
+                self._audio_queue = compat.Queue()
                 self._audio_task = self._transport.create_task(self._audio_task_handler())
 
         async def _cancel_audio_task(self):
@@ -737,12 +736,10 @@ class BaseOutputTransport(FrameProcessor):
             async def without_mixer(vad_stop_secs: float) -> AsyncGenerator[Frame, None]:
                 while True:
                     try:
-                        frame = await asyncio.wait_for(
-                            self._audio_queue.get(), timeout=vad_stop_secs
-                        )
+                        frame = await compat.wait_for(self._audio_queue.get(), vad_stop_secs)
                         yield frame
                         self._audio_queue.task_done()
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         # Fallback: notify the bot stopped speaking upstream if necessary based on timeout.
                         await self._bot_stopped_speaking()
 
@@ -757,7 +754,7 @@ class BaseOutputTransport(FrameProcessor):
                             last_frame_time = time.time()
                         yield frame
                         self._audio_queue.task_done()
-                    except asyncio.QueueEmpty:
+                    except compat.WouldBlock:
                         # Fallback: notify the bot stopped speaking upstream if necessary based on timeout.
                         diff_time = time.time() - last_frame_time
                         if diff_time > vad_stop_secs:
@@ -769,11 +766,11 @@ class BaseOutputTransport(FrameProcessor):
                             num_channels=self._params.audio_out_channels,
                         )
                         yield frame
-                        # Allow other asyncio tasks to execute by adding a small sleep
-                        # Without this sleep, in task cancellation scenarios, this loop would
+                        # Allow other tasks to execute by yielding control to the scheduler.
+                        # Without this checkpoint, in task cancellation scenarios, this loop would
                         # continuously return without any delay, leading to 100% CPU utilization
                         # and preventing cancel/stop signals from being processed properly
-                        await asyncio.sleep(0)
+                        await compat.checkpoint()
 
             if self._mixer:
                 return with_mixer(BOT_VAD_STOP_FALLBACK_SECS)
@@ -827,7 +824,7 @@ class BaseOutputTransport(FrameProcessor):
         def _create_video_task(self):
             """Create the video processing task if video output is enabled."""
             if not self._video_task and self._params.video_out_enabled:
-                self._video_queue = asyncio.Queue()
+                self._video_queue = compat.Queue()
                 self._video_task = self._transport.create_task(self._video_task_handler())
 
         async def _cancel_video_task(self):
@@ -865,9 +862,9 @@ class BaseOutputTransport(FrameProcessor):
                 elif self._video_images:
                     image = next(self._video_images)
                     await self._draw_image(image)
-                    await asyncio.sleep(self._video_frame_duration)
+                    await compat.sleep(self._video_frame_duration)
                 else:
-                    await asyncio.sleep(self._video_frame_duration)
+                    await compat.sleep(self._video_frame_duration)
 
         async def _video_is_live_handler(self):
             """Handle live video streaming with frame timing."""
@@ -887,7 +884,7 @@ class BaseOutputTransport(FrameProcessor):
                 self._video_start_time = time.time()
                 self._video_frame_index = 0
             elif delay_time > 0:
-                await asyncio.sleep(delay_time)
+                await compat.sleep(delay_time)
                 self._video_frame_index += 1
 
             # Render image
@@ -918,8 +915,8 @@ class BaseOutputTransport(FrameProcessor):
 
                 return frame
 
-            frame = await self._transport.get_event_loop().run_in_executor(
-                self._executor, resize_frame, frame
+            frame = await compat.to_thread.run_sync(
+                resize_frame, frame, limiter=self._resize_limiter
             )
             await self._transport.write_video_frame(frame)
 
@@ -930,7 +927,7 @@ class BaseOutputTransport(FrameProcessor):
         def _create_clock_task(self):
             """Create the clock/timing processing task."""
             if not self._clock_task:
-                self._clock_queue = asyncio.PriorityQueue()
+                self._clock_queue = compat.PriorityQueue()
                 self._clock_task = self._transport.create_task(self._clock_task_handler())
 
         async def _cancel_clock_task(self):
@@ -955,7 +952,7 @@ class BaseOutputTransport(FrameProcessor):
                     current_time = self._transport.get_clock().get_time()
                     if timestamp > current_time:
                         wait_time = nanoseconds_to_seconds(timestamp - current_time)
-                        await asyncio.sleep(wait_time)
+                        await compat.sleep(wait_time)
 
                     # Push frame downstream.
                     await self._transport.push_frame(frame)

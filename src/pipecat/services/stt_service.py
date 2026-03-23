@@ -6,7 +6,6 @@
 
 """Base classes for Speech-to-Text services with continuous and segmented processing."""
 
-import asyncio
 import io
 import time
 import warnings
@@ -37,6 +36,7 @@ from pipecat.services.settings import STTSettings, is_given
 from pipecat.services.stt_latency import DEFAULT_TTFS_P99
 from pipecat.services.websocket_service import WebsocketService
 from pipecat.transcriptions.language import Language
+from pipecat.utils.asyncio import compat
 
 # Duration in seconds of silent audio sent for WebSocket keepalive (100ms).
 _KEEPALIVE_SILENCE_DURATION = 0.1
@@ -151,7 +151,7 @@ class STTService(AIService):
 
         # STT TTFB tracking state
         self._stt_ttfb_timeout = stt_ttfb_timeout
-        self._ttfb_timeout_task: Optional[asyncio.Task] = None
+        self._ttfb_timeout_task: Optional[compat.Task] = None
         self._user_speaking: bool = False
         self._finalize_pending: bool = False
         self._finalize_requested: bool = False
@@ -160,7 +160,7 @@ class STTService(AIService):
         # Keepalive state
         self._keepalive_timeout = keepalive_timeout
         self._keepalive_interval = keepalive_interval
-        self._keepalive_task: Optional[asyncio.Task] = None
+        self._keepalive_task: Optional[compat.Task] = None
         self._last_audio_time: float = 0
 
         self._register_event_handler("on_connected")
@@ -523,10 +523,10 @@ class STTService(AIService):
         If no transcription arrived, no TTFB is reported.
         """
         try:
-            await asyncio.sleep(self._stt_ttfb_timeout)
+            await compat.sleep(self._stt_ttfb_timeout)
             if self._last_transcript_time > 0:
                 await self.stop_ttfb_metrics(end_time=self._last_transcript_time)
-        except asyncio.CancelledError:
+        except compat.get_cancelled_exc_class():
             # Task was cancelled (new utterance or interruption), which is expected behavior
             pass
         finally:
@@ -555,7 +555,7 @@ class STTService(AIService):
         _send_keepalive() for service-specific formatting and sending.
         """
         while True:
-            await asyncio.sleep(self._keepalive_interval)
+            await compat.sleep(self._keepalive_interval)
             try:
                 if not self._is_keepalive_ready():
                     continue

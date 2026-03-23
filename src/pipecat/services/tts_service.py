@@ -6,7 +6,6 @@
 
 """Base classes for Text-to-speech services."""
 
-import asyncio
 import uuid
 import warnings
 from abc import abstractmethod
@@ -58,6 +57,7 @@ from pipecat.services.ai_service import AIService
 from pipecat.services.settings import TTSSettings, is_given
 from pipecat.services.websocket_service import WebsocketService
 from pipecat.transcriptions.language import Language
+from pipecat.utils.asyncio import compat
 from pipecat.utils.text.base_text_aggregator import BaseTextAggregator
 from pipecat.utils.text.base_text_filter import BaseTextFilter
 from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
@@ -333,8 +333,8 @@ class TTSService(AIService):
 
         self._resampler = create_stream_resampler()
 
-        self._stop_frame_task: Optional[asyncio.Task] = None
-        self._stop_frame_queue: asyncio.Queue = asyncio.Queue()
+        self._stop_frame_task: Optional[compat.Task] = None
+        self._stop_frame_queue: compat.Queue = compat.Queue()
 
         self._processing_text: bool = False
         self._tts_contexts: Dict[str, TTSContext] = {}
@@ -367,8 +367,8 @@ class TTSService(AIService):
         # finishes playing. Merging them would null out the playback cursor prematurely.
         self._playing_context_id: Optional[str] = None
         self._turn_context_id: Optional[str] = None
-        self._audio_contexts: Dict[str, asyncio.Queue] = {}
-        self._audio_context_task: Optional[asyncio.Task] = None
+        self._audio_contexts: Dict[str, compat.Queue] = {}
+        self._audio_context_task: Optional[compat.Task] = None
 
         self._register_event_handler("on_connected")
         self._register_event_handler("on_disconnected")
@@ -1097,7 +1097,7 @@ class TTSService(AIService):
         context_id = None
         while True:
             try:
-                frame = await asyncio.wait_for(
+                frame = await compat.wait_for(
                     self._stop_frame_queue.get(), timeout=self._stop_frame_timeout_s
                 )
                 if isinstance(frame, TTSStartedFrame):
@@ -1105,7 +1105,7 @@ class TTSService(AIService):
                     has_started = True
                 elif isinstance(frame, (TTSStoppedFrame, InterruptionFrame)):
                     has_started = False
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 if has_started:
                     await self.push_frame(TTSStoppedFrame(context_id=context_id))
                     has_started = False
@@ -1218,7 +1218,7 @@ class TTSService(AIService):
             context_id: Unique identifier for the audio context.
         """
         await self._serialization_queue.put(context_id)
-        self._audio_contexts[context_id] = asyncio.Queue()
+        self._audio_contexts[context_id] = compat.Queue()
         logger.trace(f"{self} created audio context {context_id}")
 
     async def append_to_audio_context(self, context_id: str, frame: Frame):
@@ -1316,8 +1316,8 @@ class TTSService(AIService):
             #   Frame – a non-system downstream frame (e.g. AggregatedTextFrame, FooFrame) that
             #           must be emitted in-order relative to surrounding audio contexts.
             #   None  – shutdown sentinel (sent by stop()).
-            self._serialization_queue: asyncio.Queue = asyncio.Queue()
-            self._audio_contexts: Dict[str, asyncio.Queue] = {}
+            self._serialization_queue: compat.Queue = compat.Queue()
+            self._audio_contexts: Dict[str, compat.Queue] = {}
             self._audio_context_task = self.create_task(self._audio_context_task_handler())
 
     async def _stop_audio_context_task(self):
@@ -1367,7 +1367,7 @@ class TTSService(AIService):
         timestamps_started = False
         while running:
             try:
-                frame = await asyncio.wait_for(queue.get(), timeout=AUDIO_CONTEXT_TIMEOUT)
+                frame = await compat.wait_for(queue.get(), timeout=AUDIO_CONTEXT_TIMEOUT)
                 if frame is TTSService._CONTEXT_KEEPALIVE:
                     # Context is still in use, reset the timeout.
                     continue
@@ -1393,7 +1393,7 @@ class TTSService(AIService):
                         await self.push_error_frame(frame)
                     else:
                         await self.push_frame(frame)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # We didn't get audio, so let's consider this context finished.
                 logger.trace(f"{self} time out on audio context {context_id}")
                 break

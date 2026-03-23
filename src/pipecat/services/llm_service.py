@@ -6,7 +6,6 @@
 
 """Base classes for Large Language Model services with function calling support."""
 
-import asyncio
 import inspect
 import warnings
 from dataclasses import dataclass
@@ -61,6 +60,7 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.ai_service import AIService
 from pipecat.services.settings import LLMSettings
 from pipecat.turns.user_turn_completion_mixin import UserTurnCompletionLLMServiceMixin
+from pipecat.utils.asyncio import compat
 from pipecat.utils.context.llm_context_summarization import (
     DEFAULT_SUMMARIZATION_TIMEOUT,
     LLMContextSummarizationUtil,
@@ -216,10 +216,15 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService):
         self._start_callbacks = {}
         self._adapter = self.adapter_class()
         self._functions: Dict[Optional[str], FunctionCallRegistryItem] = {}
-        self._function_call_tasks: Dict[Optional[asyncio.Task], FunctionCallRunnerItem] = {}
-        self._sequential_runner_task: Optional[asyncio.Task] = None
+        # TODO(anyio): This dict is keyed by task objects and relies on
+        # add_done_callback/remove_done_callback for cleanup, which are
+        # asyncio.Task-only. Under trio, TaskHandle doesn't support these
+        # methods. The parallel-function-call cleanup logic needs restructuring
+        # (e.g., wrap the coroutine to self-remove in a finally block).
+        self._function_call_tasks: Dict[Optional[compat.Task], FunctionCallRunnerItem] = {}
+        self._sequential_runner_task: Optional[compat.Task] = None
         self._skip_tts: Optional[bool] = None
-        self._summary_task: Optional[asyncio.Task] = None
+        self._summary_task: Optional[compat.Task] = None
 
         self._register_event_handler("on_function_calls_started")
         self._register_event_handler("on_completion_timeout")
@@ -483,11 +488,11 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService):
         timeout = frame.summarization_timeout or DEFAULT_SUMMARIZATION_TIMEOUT
 
         try:
-            summary, last_index = await asyncio.wait_for(
+            summary, last_index = await compat.wait_for(
                 self._generate_summary(frame),
-                timeout=timeout,
+                timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await self.push_error(error_msg=f"Context summarization timed out after {timeout}s")
         except Exception as e:
             error = f"Error generating context summary: {e}"
@@ -788,7 +793,7 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService):
 
     async def _create_sequential_runner_task(self):
         if not self._sequential_runner_task:
-            self._sequential_runner_queue = asyncio.Queue()
+            self._sequential_runner_queue: compat.Queue[FunctionCallRunnerItem] = compat.Queue()
             self._sequential_runner_task = self.create_task(self._sequential_runner_handler())
 
     async def _cancel_sequential_runner_task(self):
@@ -817,6 +822,11 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService):
             task = self.create_task(self._run_function_call(runner_item))
             tasks.append(task)
             self._function_call_tasks[task] = runner_item
+            # TODO(anyio): add_done_callback is asyncio.Task-only. TaskHandle
+            # (trio backend) doesn't support it. Restructure to wrap the
+            # coroutine so it removes itself from _function_call_tasks in a
+            # finally block, being careful about dict-mutation-during-iteration
+            # in _cancel_function_call.
             task.add_done_callback(self._function_call_task_finished)
 
     async def _run_sequential_function_calls(self, runner_items: Sequence[FunctionCallRunnerItem]):
@@ -859,7 +869,7 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService):
             cancel_on_interruption=item.cancel_on_interruption,
         )
 
-        timeout_task: Optional[asyncio.Task] = None
+        timeout_task: Optional[compat.Task] = None
 
         # Define a callback function that pushes a FunctionCallResultFrame upstream & downstream.
         async def function_call_result_callback(
@@ -889,14 +899,14 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService):
                     if item.timeout_secs is not None
                     else self._function_call_timeout_secs
                 )
-                await asyncio.sleep(effective_timeout)
+                await compat.sleep(effective_timeout)
                 logger.warning(
                     f"{self} Function call [{runner_item.function_name}:{runner_item.tool_call_id}] timed out after {effective_timeout} seconds."
                     f" You can increase this timeout by passing `timeout_secs` to `register_function()`,"
                     f" or set a global default via `function_call_timeout_secs` on the LLM constructor."
                 )
                 await function_call_result_callback(None)
-            except asyncio.CancelledError:
+            except compat.get_cancelled_exc_class():
                 raise
 
         timeout_task = self.create_task(timeout_handler())
@@ -905,7 +915,7 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService):
             # Yield to the event loop so the timeout task coroutine gets entered
             # before it could be cancelled. Without this, cancelling the task before
             # it starts would leave the coroutine in a "never awaited" state.
-            await asyncio.sleep(0)
+            await compat.checkpoint()
             if isinstance(item.handler, DirectFunctionWrapper):
                 # Handler is a DirectFunctionWrapper
                 await item.handler.invoke(
@@ -961,6 +971,9 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService):
                     # We remove the callback because we are going to cancel the
                     # task next, otherwise we will be removing it from the set
                     # while we are iterating.
+                    # TODO(anyio): remove_done_callback is asyncio.Task-only.
+                    # See the matching TODO on add_done_callback in
+                    # _run_parallel_function_calls.
                     task.remove_done_callback(self._function_call_task_finished)
                     await self.cancel_task(task)
                     cancelled_tasks.add(task)
@@ -975,6 +988,6 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService):
         for task in cancelled_tasks:
             self._function_call_task_finished(task)
 
-    def _function_call_task_finished(self, task: asyncio.Task):
+    def _function_call_task_finished(self, task: compat.Task):
         if task in self._function_call_tasks:
             del self._function_call_tasks[task]

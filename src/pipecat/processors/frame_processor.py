@@ -48,6 +48,7 @@ from pipecat.frames.frames import (
 from pipecat.metrics.metrics import LLMTokenUsage, MetricsData
 from pipecat.observers.base_observer import BaseObserver, FrameProcessed, FramePushed
 from pipecat.processors.metrics.frame_processor_metrics import FrameProcessorMetrics
+from pipecat.utils.asyncio import compat
 from pipecat.utils.asyncio.task_manager import BaseTaskManager
 from pipecat.utils.base_object import BaseObject
 
@@ -82,7 +83,7 @@ class FrameProcessorSetup:
     observer: Optional[BaseObserver] = None
 
 
-class FrameProcessorQueue(asyncio.PriorityQueue):
+class FrameProcessorQueue(compat.PriorityQueue):
     """A priority queue for systems frames and other frames.
 
     This is a specialized queue for frame processors that separates and
@@ -134,7 +135,7 @@ class FrameProcessorQueue(asyncio.PriorityQueue):
 
 
 # Timeout in seconds for cancelling the input frame processing task.
-# This prevents hanging if a library swallows asyncio.CancelledError.
+# This prevents hanging if a library swallows the cancellation exception.
 INPUT_TASK_CANCEL_TIMEOUT_SECS = 3
 
 
@@ -225,8 +226,8 @@ class FrameProcessor(BaseObject):
         # frames right away and queues non-system frames for later processing.
         self.__should_block_system_frames = False
         self.__input_queue = FrameProcessorQueue()
-        self.__input_event: Optional[asyncio.Event] = None
-        self.__input_frame_task: Optional[asyncio.Task] = None
+        self.__input_event: Optional[compat.Event] = None
+        self.__input_frame_task: Optional[compat.Task] = None
 
         # The process task processes non-system frames.  Non-system frames will
         # be processed as soon as they are received by the processing task
@@ -234,9 +235,9 @@ class FrameProcessor(BaseObject):
         # called. To resume processing frames we need to call
         # `resume_processing_frames()` which will wake up the event.
         self.__should_block_frames = False
-        self.__process_queue = asyncio.Queue()
-        self.__process_event: Optional[asyncio.Event] = None
-        self.__process_frame_task: Optional[asyncio.Task] = None
+        self.__process_queue: compat.Queue = compat.Queue()
+        self.__process_event: Optional[compat.Event] = None
+        self.__process_frame_task: Optional[compat.Task] = None
         self.__process_current_frame: Optional[Frame] = None
 
         # Frame processor events.
@@ -498,7 +499,7 @@ class FrameProcessor(BaseObject):
         await self.stop_processing_metrics()
         await self.stop_text_aggregation_metrics()
 
-    def create_task(self, coroutine: Coroutine, name: Optional[str] = None) -> asyncio.Task:
+    def create_task(self, coroutine: Coroutine, name: Optional[str] = None) -> compat.Task:
         """Create a new task managed by this processor.
 
         Args:
@@ -506,7 +507,7 @@ class FrameProcessor(BaseObject):
             name: Optional name for the task.
 
         Returns:
-            The created asyncio task.
+            The created task handle (``asyncio.Task`` on asyncio, ``TaskHandle`` on trio).
         """
         if name:
             name = f"{self}::{name}"
@@ -514,12 +515,12 @@ class FrameProcessor(BaseObject):
             name = f"{self}::{coroutine.cr_code.co_name}"
         return self.task_manager.create_task(coroutine, name)
 
-    async def cancel_task(self, task: asyncio.Task, timeout: Optional[float] = 1.0):
+    async def cancel_task(self, task: compat.Task, timeout: Optional[float] = 1.0):
         """Cancel a task managed by this processor.
 
         A default timeout if 1 second is used in order to avoid potential
-        freezes caused by certain libraries that swallow
-        `asyncio.CancelledError`.
+        freezes caused by certain libraries that swallow the cancellation
+        exception.
 
         Args:
             task: The task to cancel.
@@ -527,7 +528,7 @@ class FrameProcessor(BaseObject):
         """
         await self.task_manager.cancel_task(task, timeout)
 
-    async def wait_for_task(self, task: asyncio.Task, timeout: Optional[float] = None):
+    async def wait_for_task(self, task: compat.Task, timeout: Optional[float] = None):
         """Wait for a task to complete.
 
         .. deprecated:: 0.0.81
@@ -550,7 +551,7 @@ class FrameProcessor(BaseObject):
             )
 
         if timeout:
-            await asyncio.wait_for(task, timeout)
+            await compat.wait_for(task, timeout)
         else:
             await task
 
@@ -606,7 +607,14 @@ class FrameProcessor(BaseObject):
 
         Returns:
             The asyncio event loop.
+
+        .. note::
+            This method is asyncio-specific. Under trio there is no event
+            loop object; calling this will raise. Prefer backend-agnostic
+            primitives from ``pipecat.utils.asyncio.compat`` instead.
         """
+        # TODO(anyio): asyncio-only API. Trio has no loop object; callers
+        # should migrate to compat primitives. Kept for backward compat.
         return self.task_manager.get_event_loop()
 
     async def queue_frame(
@@ -962,15 +970,16 @@ class FrameProcessor(BaseObject):
             return
 
         if not self.__input_frame_task:
-            self.__input_event = asyncio.Event()
+            self.__input_event = compat.Event()
             self.__input_frame_task = self.create_task(self.__input_frame_task_handler())
 
     async def __cancel_input_task(self):
         """Cancel the frame input processing task."""
         if self.__input_frame_task:
-            # Apply a timeout as a safeguard: if a library swallows asyncio.CancelledError,
-            # the task would otherwise never be cancelled. With a timeout, we can detect this
-            # situation and surface it in the logs instead of hanging indefinitely.
+            # Apply a timeout as a safeguard: if a library swallows the cancellation
+            # exception, the task would otherwise never be cancelled. With a timeout, we
+            # can detect this situation and surface it in the logs instead of hanging
+            # indefinitely.
             await self.cancel_task(self.__input_frame_task, INPUT_TASK_CANCEL_TIMEOUT_SECS)
             self.__input_frame_task = None
 
@@ -989,13 +998,13 @@ class FrameProcessor(BaseObject):
             return
 
         self.__should_block_frames = False
-        self.__process_event = asyncio.Event()
+        self.__process_event = compat.Event()
         self.__reset_process_queue()
 
     def __reset_process_queue(self):
         """Reset non-system frame processing queue."""
         # Create a new queue to insert UninterruptibleFrame frames.
-        new_queue = asyncio.Queue()
+        new_queue: compat.Queue = compat.Queue()
 
         # Process current queue and keep UninterruptibleFrame frames.
         while not self.__process_queue.empty():
