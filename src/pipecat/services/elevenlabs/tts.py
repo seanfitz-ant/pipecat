@@ -10,7 +10,6 @@ This module provides WebSocket and HTTP-based TTS services using ElevenLabs API
 with support for streaming audio, word timestamps, and voice customization.
 """
 
-import asyncio
 import base64
 import json
 from dataclasses import dataclass, field
@@ -51,9 +50,14 @@ from pipecat.services.tts_service import (
     WebsocketTTSService,
 )
 from pipecat.transcriptions.language import Language, resolve_language
+from pipecat.utils.asyncio.compat import current_backend, sleep
 from pipecat.utils.tracing.service_decorators import traced_tts
 
 # See .env.example for ElevenLabs configuration needed
+# TODO(anyio): websockets.asyncio is asyncio-only; ElevenLabsTTSService will
+# not run under trio until we migrate to an anyio-native websocket client
+# (e.g. httpx-ws). ElevenLabsHttpTTSService also takes a user-provided
+# aiohttp.ClientSession which is asyncio-only.
 try:
     import websockets
     from websockets.asyncio.client import connect as websocket_connect
@@ -657,6 +661,10 @@ class ElevenLabsTTSService(WebsocketTTSService):
         await self._disconnect_websocket()
 
     async def _connect_websocket(self):
+        if current_backend() == "trio":
+            raise RuntimeError(
+                "ElevenLabsTTSService requires asyncio (websockets library limitation)"
+            )
         try:
             if self._websocket and self._websocket.state is State.OPEN:
                 return
@@ -820,7 +828,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
         """Send periodic keepalive messages to maintain WebSocket connection."""
         KEEPALIVE_SLEEP = 10
         while True:
-            await asyncio.sleep(KEEPALIVE_SLEEP)
+            await sleep(KEEPALIVE_SLEEP)
             try:
                 if self._websocket and self._websocket.state is State.OPEN:
                     context_id = self.get_active_audio_context_id()

@@ -6,7 +6,6 @@
 
 """Deepgram Flux speech-to-text service implementation."""
 
-import asyncio
 import json
 import time
 from dataclasses import dataclass, field
@@ -31,9 +30,13 @@ from pipecat.frames.frames import (
 from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language
+from pipecat.utils.asyncio.compat import Event, current_backend, sleep
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
 
+# TODO(anyio): websockets.asyncio is asyncio-only; DeepgramFluxSTTService
+# will not run under trio until we migrate to an anyio-native websocket
+# client (e.g. httpx-ws).
 try:
     from websockets.asyncio.client import connect as websocket_connect
     from websockets.protocol import State
@@ -275,7 +278,7 @@ class DeepgramFluxSTTService(WebsocketSTTService):
         self._register_event_handler("on_end_of_turn")
         self._register_event_handler("on_eager_end_of_turn")
         self._register_event_handler("on_update")
-        self._connection_established_event = asyncio.Event()
+        self._connection_established_event = Event()
         # Watchdog task to prevent dangling tasks
         # If we stop sending audio to Flux after we have received that the User has started speaking
         # we never receive the user stopped speaking event unless we resume sending audio to it.
@@ -326,7 +329,7 @@ class DeepgramFluxSTTService(WebsocketSTTService):
                 await self._send_silence()
                 self._last_stt_time = time.monotonic()
             # check every 100ms
-            await asyncio.sleep(0.1)
+            await sleep(0.1)
 
     async def _connect_websocket(self):
         """Establish WebSocket connection to API.
@@ -335,6 +338,10 @@ class DeepgramFluxSTTService(WebsocketSTTService):
         URL and authentication headers. Handles connection errors and reports them
         through the event handler system.
         """
+        if current_backend() == "trio":
+            raise RuntimeError(
+                "DeepgramFluxSTTService requires asyncio (websockets library limitation)"
+            )
         try:
             if self._websocket and self._websocket.state is State.OPEN:
                 return

@@ -28,8 +28,13 @@ from pipecat.frames.frames import (
 )
 from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService, WebsocketTTSService
+from pipecat.utils.asyncio.compat import current_backend
 from pipecat.utils.tracing.service_decorators import traced_tts
 
+# TODO(anyio): websockets.asyncio is asyncio-only; DeepgramTTSService will
+# not run under trio until we migrate to an anyio-native websocket client
+# (e.g. httpx-ws). DeepgramHttpTTSService also takes a user-provided
+# aiohttp.ClientSession which is asyncio-only.
 try:
     from websockets.asyncio.client import connect as websocket_connect
     from websockets.protocol import State
@@ -209,6 +214,10 @@ class DeepgramTTSService(WebsocketTTSService):
 
     async def _connect_websocket(self):
         """Connect to Deepgram WebSocket API with configured settings."""
+        if current_backend() == "trio":
+            raise RuntimeError(
+                "DeepgramTTSService requires asyncio (websockets library limitation)"
+            )
         try:
             if self._websocket and self._websocket.state is State.OPEN:
                 return

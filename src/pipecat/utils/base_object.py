@@ -95,12 +95,12 @@ class BaseObject(ABC):
         It waits for all currently executing event handler tasks to finish
         before returning.
         """
-        if self._event_tasks:
+        # Under trio, handlers run inline so _event_tasks is never populated
+        # and there's nothing to wait on. Under asyncio, we spawn detached
+        # tasks and must wait for them here.
+        if self._event_tasks and compat.current_backend() == "asyncio":
             event_names, tasks = zip(*self._event_tasks)
             logger.debug(f"{self}: waiting on event handlers to finish {list(event_names)}...")
-            # TODO(anyio): asyncio.wait() on raw Task objects has no anyio
-            # equivalent. This is only reached on asyncio since _event_tasks is
-            # only populated there (see _call_event_handler).
             await asyncio.wait(tasks)
 
     def event_handler(self, event_name: str):
@@ -177,12 +177,14 @@ class BaseObject(ABC):
                 # Remove the task from the event tasks list when the task completes.
                 task.add_done_callback(self._event_task_finished)
             else:
-                # TODO(anyio): trio/anyio requires structured concurrency
-                # (nursery/TaskGroup) — there is no equivalent to detached
-                # tasks with done callbacks. Proper support needs a task group
-                # owned by the object lifecycle (entered in an async setup,
-                # exited in cleanup). For now, run the handler inline to
-                # preserve correctness on trio at the cost of concurrency.
+                # trio requires structured concurrency (nursery/TaskGroup) and
+                # has no detached-task equivalent. BaseObject has no
+                # TaskManager reference, so we can't spawn into a task group
+                # here. Running the handler inline is the correct trade-off:
+                # it preserves correctness at the cost of concurrency. Handlers
+                # that need to be non-blocking under trio should be registered
+                # with sync=True and keep their work short, or dispatch into a
+                # task group they own.
                 await self._run_handler(event_handler.name, handler, *args, **kwargs)
 
     async def _run_handler(self, event_name: str, handler, *args, **kwargs):

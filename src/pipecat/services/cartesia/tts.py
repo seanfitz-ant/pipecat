@@ -28,11 +28,16 @@ from pipecat.frames.frames import (
 from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven
 from pipecat.services.tts_service import TextAggregationMode, TTSService, WebsocketTTSService
 from pipecat.transcriptions.language import Language, resolve_language
+from pipecat.utils.asyncio.compat import current_backend
 from pipecat.utils.text.base_text_aggregator import BaseTextAggregator
 from pipecat.utils.text.skip_tags_aggregator import SkipTagsAggregator
 from pipecat.utils.tracing.service_decorators import traced_tts
 
 # See .env.example for Cartesia configuration needed
+# TODO(anyio): websockets.asyncio is asyncio-only; CartesiaTTSService will
+# not run under trio until we migrate to an anyio-native websocket client
+# (e.g. httpx-ws). CartesiaHttpTTSService also takes a user-provided
+# aiohttp.ClientSession which is asyncio-only.
 try:
     from websockets.asyncio.client import connect as websocket_connect
     from websockets.protocol import State
@@ -536,6 +541,10 @@ class CartesiaTTSService(WebsocketTTSService):
         await self._disconnect_websocket()
 
     async def _connect_websocket(self):
+        if current_backend() == "trio":
+            raise RuntimeError(
+                "CartesiaTTSService requires asyncio (websockets library limitation)"
+            )
         try:
             if self._websocket and self._websocket.state is State.OPEN:
                 return
