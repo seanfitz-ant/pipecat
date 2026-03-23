@@ -296,3 +296,70 @@ class TestUnifiedTaskManager:
         tm = TaskManager()
         with pytest.raises(RuntimeError, match="requires a task_group"):
             tm.setup(TaskManagerParams())
+
+    async def test_done_callback_fires(self, anyio_backend):
+        """TaskHandle.add_done_callback works like asyncio.Task's."""
+        async with AnyioTaskManager() as tm:
+            fired = []
+
+            async def work():
+                await sleep(0)
+                return "ok"
+
+            handle = tm.create_task(work(), name="cb")
+            handle.add_done_callback(lambda h: fired.append(h.get_name()))
+            await handle
+            assert fired == ["cb"]
+
+    async def test_remove_done_callback(self, anyio_backend):
+        async with AnyioTaskManager() as tm:
+            fired = []
+
+            def cb(h):
+                fired.append(1)
+
+            async def work():
+                await sleep(0.01)
+
+            handle = tm.create_task(work(), name="rm")
+            handle.add_done_callback(cb)
+            assert handle.remove_done_callback(cb) == 1
+            await handle
+            assert fired == []
+
+
+class TestPipelineUnderTrio:
+    """End-to-end test: run a real pipeline under trio."""
+
+    async def test_simple_pipeline_runs(self, anyio_backend):
+        from pipecat.frames.frames import EndFrame, TextFrame
+        from pipecat.pipeline.base_task import PipelineTaskParams
+        from pipecat.pipeline.pipeline import Pipeline
+        from pipecat.pipeline.task import PipelineTask
+        from pipecat.processors.filters.identity_filter import IdentityFilter
+        from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
+        received: list = []
+
+        class Sink(FrameProcessor):
+            async def process_frame(self, frame, direction):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, TextFrame):
+                    received.append(frame.text)
+                await self.push_frame(frame, direction)
+
+        pipeline = Pipeline([IdentityFilter(), Sink()])
+        task = PipelineTask(pipeline, cancel_on_idle_timeout=False)
+
+        await task.queue_frames([TextFrame("hello"), TextFrame("trio"), EndFrame()])
+
+        if anyio_backend == "asyncio":
+            import asyncio
+
+            params = PipelineTaskParams(loop=asyncio.get_running_loop())
+        else:
+            params = PipelineTaskParams()
+
+        await task.run(params)
+        assert received == ["hello", "trio"]
+        assert task.has_finished()

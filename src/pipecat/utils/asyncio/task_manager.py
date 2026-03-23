@@ -241,6 +241,7 @@ class TaskManager(BaseTaskManager):
                         )
             finally:
                 handle._done.set()
+                handle._fire_done_callbacks()
                 self._tasks.pop(name, None)
 
         self._tasks[name] = TaskData(task=handle)

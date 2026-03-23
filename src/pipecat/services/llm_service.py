@@ -216,11 +216,6 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService):
         self._start_callbacks = {}
         self._adapter = self.adapter_class()
         self._functions: Dict[Optional[str], FunctionCallRegistryItem] = {}
-        # TODO(anyio): This dict is keyed by task objects and relies on
-        # add_done_callback/remove_done_callback for cleanup, which are
-        # asyncio.Task-only. Under trio, TaskHandle doesn't support these
-        # methods. The parallel-function-call cleanup logic needs restructuring
-        # (e.g., wrap the coroutine to self-remove in a finally block).
         self._function_call_tasks: Dict[Optional[compat.Task], FunctionCallRunnerItem] = {}
         self._sequential_runner_task: Optional[compat.Task] = None
         self._skip_tts: Optional[bool] = None
@@ -822,11 +817,6 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService):
             task = self.create_task(self._run_function_call(runner_item))
             tasks.append(task)
             self._function_call_tasks[task] = runner_item
-            # TODO(anyio): add_done_callback is asyncio.Task-only. TaskHandle
-            # (trio backend) doesn't support it. Restructure to wrap the
-            # coroutine so it removes itself from _function_call_tasks in a
-            # finally block, being careful about dict-mutation-during-iteration
-            # in _cancel_function_call.
             task.add_done_callback(self._function_call_task_finished)
 
     async def _run_sequential_function_calls(self, runner_items: Sequence[FunctionCallRunnerItem]):
@@ -971,9 +961,6 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService):
                     # We remove the callback because we are going to cancel the
                     # task next, otherwise we will be removing it from the set
                     # while we are iterating.
-                    # TODO(anyio): remove_done_callback is asyncio.Task-only.
-                    # See the matching TODO on add_done_callback in
-                    # _run_parallel_function_calls.
                     task.remove_done_callback(self._function_call_task_finished)
                     await self.cancel_task(task)
                     cancelled_tasks.add(task)

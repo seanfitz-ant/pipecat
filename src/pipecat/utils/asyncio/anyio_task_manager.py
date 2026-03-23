@@ -35,7 +35,7 @@ Usage::
 from __future__ import annotations
 
 import traceback
-from typing import Any, Coroutine, Dict, Optional, Sequence
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence
 
 import anyio
 import anyio.abc
@@ -65,6 +65,7 @@ class TaskHandle:
         self._done = anyio.Event()
         self._result: Any = None
         self._exception: Optional[BaseException] = None
+        self._done_callbacks: List[Callable[["TaskHandle"], Any]] = []
 
     def get_name(self) -> str:
         """Return the task name."""
@@ -87,6 +88,37 @@ class TaskHandle:
     def cancelled(self) -> bool:
         """Return ``True`` if cancellation was requested."""
         return self._cancel_requested
+
+    def add_done_callback(self, callback: Callable[["TaskHandle"], Any]) -> None:
+        """Register a callback to run when the task finishes.
+
+        Mirrors :meth:`asyncio.Task.add_done_callback`. If the task is
+        already done the callback fires immediately.
+        """
+        if self.done():
+            callback(self)
+        else:
+            self._done_callbacks.append(callback)
+
+    def remove_done_callback(self, callback: Callable[["TaskHandle"], Any]) -> int:
+        """Remove a previously registered done callback.
+
+        Returns the number of callbacks removed (0 or 1), matching
+        :meth:`asyncio.Task.remove_done_callback`.
+        """
+        try:
+            self._done_callbacks.remove(callback)
+            return 1
+        except ValueError:
+            return 0
+
+    def _fire_done_callbacks(self) -> None:
+        callbacks, self._done_callbacks = self._done_callbacks, []
+        for cb in callbacks:
+            try:
+                cb(self)
+            except Exception as e:
+                logger.error(f"{self._name}: done callback raised: {e}")
 
     def done(self) -> bool:
         """Return ``True`` if the task has finished (successfully or not)."""
@@ -216,6 +248,7 @@ class AnyioTaskManager(BaseTaskManager):
                         )
             finally:
                 handle._done.set()
+                handle._fire_done_callbacks()
                 self._tasks.pop(name, None)
 
         self._tasks[name] = handle
